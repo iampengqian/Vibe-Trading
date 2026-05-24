@@ -30,6 +30,17 @@ logger = logging.getLogger(__name__)
 _DEFAULT_MAX_ITERATIONS = int(os.getenv("SWARM_WORKER_MAX_ITER", "50"))
 _DEFAULT_TIMEOUT_SECONDS = int(os.getenv("SWARM_WORKER_TIMEOUT", "300"))
 _MAX_TOKEN_ESTIMATE = 60_000
+_SENSITIVE_TOOL_ARGUMENT_KEYS = {
+    "api_key",
+    "authorization",
+    "content",
+    "env",
+    "headers",
+    "passphrase",
+    "password",
+    "secret",
+    "token",
+}
 
 
 def _emit(
@@ -86,26 +97,41 @@ def _estimate_tokens(
     messages: list[dict],
     response: object,
 ) -> tuple[int, int]:
-    """Estimate token usage for a single LLM call.
+    """Return token usage for a single LLM call, real if available.
 
-    Tries to read actual token counts from the LLM response metadata
-    (LangChain's usage_metadata). Falls back to character-length estimation
-    (len // 4) if metadata is unavailable.
+    Prefers the provider-reported counts attached to the response by
+    :func:`ChatLLM._parse_response` (``usage_metadata``). Falls back to a
+    character-length heuristic (``len // 4``) only when the provider
+    didn't return usage data — keeps the behaviour contract for legacy
+    or partial responses while making per-run totals (which feed
+    ``SwarmRun.total_input_tokens`` / ``total_output_tokens``) reflect
+    real billing instead of a CJK-hostile char-count guess.
 
     Args:
-        messages: Messages sent to the LLM for this call.
-        response: LLMResponse from ChatLLM.chat().
+        messages: Messages sent to the LLM for this call. Used only for
+            the fallback estimate when ``response.usage_metadata`` is
+            missing.
+        response: ``LLMResponse`` from ``ChatLLM.chat`` /
+            ``ChatLLM.stream_chat``.
 
     Returns:
-        Tuple of (input_tokens, output_tokens).
+        Tuple of (input_tokens, output_tokens). Either component may be
+        zero — that simply means the provider didn't report it and the
+        fallback couldn't compute it either (e.g. binary content).
     """
     from src.providers.chat import LLMResponse
 
-    input_tokens = 0
-    output_tokens = 0
+    if isinstance(response, LLMResponse) and response.usage_metadata:
+        usage = response.usage_metadata
+        real_input = int(usage.get("input_tokens") or 0)
+        real_output = int(usage.get("output_tokens") or 0)
+        if real_input or real_output:
+            return real_input, real_output
 
-    # response is an LLMResponse; it doesn't carry raw metadata.
-    # Estimate: input = serialized messages length // 4, output = content length // 4
+    # Fallback: provider didn't return usage_metadata. Estimate from
+    # serialized message length and response content length. ~4 chars per
+    # English token; under-counts for CJK / Thai / emoji-heavy prompts but
+    # at least preserves the prior behaviour.
     try:
         input_tokens = len(json.dumps(messages, ensure_ascii=False)) // 4
     except Exception:
@@ -164,9 +190,11 @@ def build_worker_prompt(
         "- Do NOT write long Python code inside bash. Use write_file + bash.\n"
         "- Do NOT fetch data with curl/requests. Use the patterns from load_skill (yfinance, OKX API via Python).\n"
         "- If a script fails, read the error, fix with `edit_file`, re-run. Max 2 retries per script.\n\n"
-        "**Phase 3 — Summarize (0 tool calls):**\n"
-        "- Write your final findings as a concise markdown summary directly in your response.\n"
-        "- Include specific numbers, dates, and actionable conclusions.\n"
+        "**Phase 3 — Summarize (MUST use write_file):**\n"
+        "- You MUST call `write_file` with path `report.md` to save your final report as a markdown file.\n"
+        "- This is REQUIRED, not optional. Your final response MUST include a write_file call for report.md.\n"
+        "- The report must include specific numbers, dates, and actionable conclusions.\n"
+        "- After writing report.md, output a brief 2-3 sentence summary in your text response.\n"
         "- Respond in the same language as the task prompt."
     )
 
@@ -281,9 +309,11 @@ def run_worker(
         # Check timeout
         elapsed = time.monotonic() - t0
         if elapsed > timeout:
-            summary = last_assistant_content or f"Worker timed out after {elapsed:.0f}s ({iteration} iterations)"
+            summary = _best_summary(messages, last_assistant_content) or f"Worker timed out after {elapsed:.0f}s ({iteration} iterations)"
+            summary = _resolve_summary(artifact_dir, summary)
             _emit(event_callback, "worker_timeout", agent_id, task_id, {"elapsed": elapsed})
             _write_summary(artifact_dir, summary)
+            _persist_messages(artifact_dir, messages)
             return WorkerResult(
                 status="timeout",
                 summary=summary,
@@ -297,6 +327,7 @@ def run_worker(
         token_estimate = len(json.dumps(messages, ensure_ascii=False)) // 4
         if token_estimate > _MAX_TOKEN_ESTIMATE:
             summary = last_assistant_content or f"Worker context too large (~{token_estimate} tokens, {iteration} iterations)"
+            summary = _resolve_summary(artifact_dir, summary)
             _emit(event_callback, "worker_token_limit", agent_id, task_id, {"tokens": token_estimate})
             _write_summary(artifact_dir, summary)
             return WorkerResult(
@@ -315,8 +346,8 @@ def run_worker(
                 "role": "user",
                 "content": (
                     f"[SYSTEM] You have {remaining} iterations remaining. "
-                    "Stop calling tools and immediately output your final analysis summary as plain text. "
-                    "Do not call any more tools."
+                    "If report.md is not written yet, make one final write_file call for report.md. "
+                    "Otherwise stop calling tools and output your final analysis summary as plain text."
                 ),
             })
 
@@ -345,7 +376,7 @@ def run_worker(
             _emit(event_callback, "worker_failed", agent_id, task_id, {"error": error_msg})
             return WorkerResult(
                 status="failed",
-                summary=last_assistant_content or "",
+                summary=_resolve_summary(artifact_dir, last_assistant_content or ""),
                 artifact_paths=_collect_artifacts(artifact_dir),
                 iterations=iteration,
                 error=error_msg,
@@ -365,6 +396,7 @@ def run_worker(
         # If no tool calls, this is the final response
         if not response.has_tool_calls:
             summary = response.content or last_assistant_content or "(no summary)"
+            summary = _resolve_summary(artifact_dir, summary)
             _emit(event_callback, "worker_completed", agent_id, task_id, {"iterations": iteration + 1})
             _write_summary(artifact_dir, summary)
             return WorkerResult(
@@ -389,7 +421,8 @@ def run_worker(
         for tc in response.tool_calls:
             _emit(
                 event_callback, "tool_call", agent_id, task_id,
-                {"tool": tc.name, "iteration": iteration},
+                {"tool": tc.name, "iteration": iteration,
+                 "arguments": _preview_tool_arguments(tc.arguments)},
             )
             tc_start = time.monotonic()
             args = {**tc.arguments, "run_dir": str(artifact_dir)}
@@ -398,16 +431,19 @@ def run_worker(
             _emit(
                 event_callback, "tool_result", agent_id, task_id,
                 {"tool": tc.name, "elapsed_ms": int(tc_elapsed * 1000),
-                 "status": "ok", "iteration": iteration},
+                 "status": "ok", "iteration": iteration,
+                 "result_preview": str(result)[:200]},
             )
             messages.append(
                 ContextBuilder.format_tool_result(tc.id, tc.name, result[:10_000])
             )
 
     # Hit iteration limit — use last meaningful content as summary
-    summary = last_assistant_content or f"Worker hit iteration limit ({max_iterations} iterations)"
+    summary = _best_summary(messages, last_assistant_content) or f"Worker hit iteration limit ({max_iterations} iterations)"
+    summary = _resolve_summary(artifact_dir, summary)
     _emit(event_callback, "worker_iteration_limit", agent_id, task_id)
     _write_summary(artifact_dir, summary)
+    _persist_messages(artifact_dir, messages)
     return WorkerResult(
         status="completed",
         summary=summary,
@@ -416,6 +452,66 @@ def run_worker(
         input_tokens=total_input_tokens,
         output_tokens=total_output_tokens,
     )
+
+
+def _best_summary(messages: list[dict], fallback: str) -> str:
+    """Extract the best summary from all assistant messages."""
+    texts = [
+        m["content"] for m in messages
+        if m.get("role") == "assistant" and m.get("content")
+        and len(m["content"].strip()) > 100
+    ]
+    if texts:
+        return max(texts, key=len)
+    return fallback
+
+
+def _preview_tool_arguments(arguments: dict) -> dict[str, str]:
+    """Return a short, redacted argument preview for streamed events."""
+    preview: dict[str, str] = {}
+    for key, value in arguments.items():
+        if key == "run_dir":
+            continue
+        if _is_sensitive_tool_argument(key):
+            preview[key] = "[redacted]"
+            continue
+        text = str(value)
+        preview[key] = text if len(text) <= 200 else text[:200] + "..."
+    return preview
+
+
+def _is_sensitive_tool_argument(key: str) -> bool:
+    """Return whether a tool argument name should be redacted in events."""
+    normalized = key.strip().lower()
+    return normalized in _SENSITIVE_TOOL_ARGUMENT_KEYS or any(
+        marker in normalized
+        for marker in ("api_key", "authorization", "password", "secret", "token")
+    )
+
+
+def _resolve_summary(artifact_dir: Path, fallback: str) -> str:
+    """Return report.md content if it exists, otherwise fall back to text."""
+    report_path = artifact_dir / "report.md"
+    try:
+        if report_path.is_file():
+            content = report_path.read_text(encoding="utf-8").strip()
+            if content:
+                return content
+    except Exception:
+        logger.warning("Failed to read report.md from %s", artifact_dir, exc_info=True)
+    return fallback
+
+
+def _persist_messages(artifact_dir: Path, messages: list[dict]) -> None:
+    """Persist messages to disk for post-mortem analysis."""
+    try:
+        path = artifact_dir / "messages.json"
+        path.write_text(
+            json.dumps(messages, ensure_ascii=False, indent=2, default=str),
+            encoding="utf-8",
+        )
+    except Exception:
+        logger.warning("Failed to persist messages to %s", artifact_dir, exc_info=True)
 
 
 def _write_summary(artifact_dir: Path, summary: str) -> None:
